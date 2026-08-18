@@ -1410,6 +1410,85 @@ static void handle_int16(uc_engine *u)
     }
 }
 
+static void handle_int13(uc_engine *u)
+{
+    uint16_t ax = reg16_read(u, UC_X86_REG_AX);
+    uint16_t bx = reg16_read(u, UC_X86_REG_BX);
+    uint16_t cx = reg16_read(u, UC_X86_REG_CX);
+    uint16_t dx = reg16_read(u, UC_X86_REG_DX);
+
+    uint8_t ah = ax >> 8;
+    uint8_t dl = dx & 0xFF;
+
+    switch (ah) {
+        case 0x00: /* Reset disk system */
+            ax = (ax & 0xFF00) | 0x00;
+            set_cf(u, false);
+            break;
+
+        case 0x01: /* Get status of last operation */
+            ax = (ax & 0xFF00) | 0x00;
+            set_cf(u, false);
+            break;
+
+        case 0x02: /* Read sectors */
+        case 0x03: /* Write sectors */
+        case 0x04: /* Verify sectors */
+            /* Raw sector I/O not natively emulated, return invalid command error */
+            ax = 0x0100;
+            set_cf(u, true);
+            break;
+
+        case 0x08: /* Get drive parameters */
+            if (dl == 0x00) { /* Floppy A: */
+                ax = (ax & 0xFF00) | 0x00;
+                bx = (bx & 0xFF00) | 0x04; /* 1.44M floppy */
+                cx = 0x4F12; /* 80 cyls, 18 sectors */
+                dx = 0x0101; /* 2 heads, 1 drive */
+                set_cf(u, false);
+            } else if (dl == 0x80) { /* HDD 0 */
+                ax = (ax & 0xFF00) | 0x00;
+                bx = (bx & 0xFF00) | 0x00;
+                cx = 0xFFFF; /* 1024 cyls, 63 sectors */
+                dx = 0x0F01; /* 16 heads, 1 drive */
+                set_cf(u, false);
+            } else {
+                ax = (ax & 0xFF00) | 0x80; /* Timeout */
+                set_cf(u, true);
+            }
+            break;
+
+        case 0x15: /* Get disk type */
+            if (dl == 0x80) {
+                ax = (ax & 0xFF00) | 0x03; /* Hard disk present */
+                cx = 0x000F; /* CX:DX = 1032192 sectors (~504 MB) */
+                dx = 0xC000;
+                set_cf(u, false);
+            } else if (dl == 0x00) {
+                ax = (ax & 0xFF00) | 0x01; /* Floppy present, no change-line */
+                set_cf(u, false);
+            } else {
+                ax = (ax & 0xFF00) | 0x00; /* Not present */
+                set_cf(u, true);
+            }
+            break;
+
+        case 0x41: /* Check INT 13h extensions */
+            set_cf(u, true); /* Not supported */
+            break;
+
+        default:
+            ax = (ax & 0xFF00) | 0x01;
+            set_cf(u, true);
+            break;
+    }
+
+    reg16_write(u, UC_X86_REG_AX, ax);
+    reg16_write(u, UC_X86_REG_BX, bx);
+    reg16_write(u, UC_X86_REG_CX, cx);
+    reg16_write(u, UC_X86_REG_DX, dx);
+}
+
 static void handle_int12(uc_engine *u)
 {
     reg16_write(u, UC_X86_REG_AX, 640);
@@ -2945,6 +3024,11 @@ static void hook_interrupt(uc_engine *u, uint32_t intno, void *user_data)
 
         case 0x12:
             handle_int12(u);
+            advance_ip(u, 2);
+            break;
+
+        case 0x13:
+            handle_int13(u);
             advance_ip(u, 2);
             break;
 
