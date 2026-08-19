@@ -473,7 +473,8 @@ static void video_init(uc_engine *u)
 
 static void video_putc(uc_engine *u, uint8_t ch, uint8_t attr)
 {
-    /* ADDED: Mirror DOS output to the Fedora terminal so you can read it easily */
+
+
     if (ch == 0x0D) putchar('\r');
     else if (ch == 0x0A) { putchar('\n'); fflush(stdout); }
     else if (ch >= 0x20 && ch < 0x7F) { putchar(ch); fflush(stdout); }
@@ -908,28 +909,46 @@ static void guest_write_cstring(uc_engine *u, uint32_t addr, const char *s, size
     uc_mem_write(u, addr + len, &zero, 1);
 }
 
+static char host_cwd[512];
+
 static int read_dos_path(uc_engine *u, uint16_t seg, uint16_t off, char *host, size_t hostsz)
 {
     char guest[512];
-    uint32_t addr = seg_off_to_linear(seg, off);
-
-    if (guest_read_cstring(u, addr, guest, sizeof(guest)) != 0)
+    if (guest_read_cstring(u, seg_off_to_linear(seg, off), guest, sizeof(guest)) != 0)
         return -1;
 
-    size_t j = 0;
     const char *p = guest;
+    int had_drive = 0;
 
-    if (p[0] != 0 && p[1] == ':')
-        p += 2;
+    /* Strip drive letter (C:, D:, ...) */
+    if (p[0] != 0 && p[1] == ':') { p += 2; had_drive = 1; }
 
-    while (*p && j + 1 < hostsz) {
+    /* Convert backslashes to slashes into a relative path */
+    char rel[512];
+    size_t j = 0;
+    while (*p && j + 1 < sizeof(rel)) {
         char c = *p++;
-        if (c == '\\')
-            c = '/';
-        host[j++] = c;
+        if (c == '\\') c = '/';
+        rel[j++] = c;
     }
+    rel[j] = 0;
 
-    host[j] = 0;
+    /* Strip leading '/' so the path is relative to the C: root */
+    const char *r = rel;
+    while (*r == '/') r++;
+
+    #ifdef _WIN32
+    /* Windows: C:\ is a real drive. Rebuild an absolute path if a drive was given. */
+    if (had_drive)
+        snprintf(host, hostsz, "C:\\%s", r);
+    else
+        snprintf(host, hostsz, "%s", r);
+    #else
+    /* Linux: the emulated C:\ == the directory the emulator was started in. */
+    if (getcwd(host_cwd, sizeof(host_cwd)) == NULL)
+        host_cwd[0] = 0;
+    snprintf(host, hostsz, "%s/%s", host_cwd, r);
+    #endif
     return 0;
 }
 
@@ -958,19 +977,20 @@ static void unix_to_dos_datetime(time_t t, uint16_t *dos_date, uint16_t *dos_tim
 static void split_path(const char *path, char *dir, size_t dirsz, char *pat, size_t patsz)
 {
     const char *slash = strrchr(path, '/');
+    #ifdef _WIN32
+    const char *bslash = strrchr(path, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+    #endif
 
     if (slash) {
         size_t len = (size_t)(slash - path);
-
         if (len == 0)
             snprintf(dir, dirsz, "/");
         else {
-            if (len >= dirsz)
-                len = dirsz - 1;
+            if (len >= dirsz) len = dirsz - 1;
             memcpy(dir, path, len);
             dir[len] = 0;
         }
-
         snprintf(pat, patsz, "%s", slash + 1);
     } else {
         snprintf(dir, dirsz, ".");
@@ -979,7 +999,6 @@ static void split_path(const char *path, char *dir, size_t dirsz, char *pat, siz
 
     if (pat[0] == 0)
         snprintf(pat, patsz, "*");
-
     if (strcmp(pat, "*.*") == 0)
         snprintf(pat, patsz, "*");
 }
@@ -3087,15 +3106,17 @@ static void hook_interrupt(uc_engine *u, uint32_t intno, void *user_data)
 static void write_environment(uc_engine *u, uint16_t env_seg)
 {
     static const char env[] =
-    "COMSPEC=/bin/sh\0"
-    "PATH=/\0"
+    "COMSPEC=C:\\COMMAND.COM\0"
+    "PATH=.\0"
+    "INCLUDE=.\0"
+    "LIB=.\0"
     "\0";
 
     uint32_t base = ((uint32_t)env_seg << 4);
     uc_mem_write(u, base, env, sizeof(env));
 }
 
-static void write_psp(uc_engine *u, uint16_t psp_seg, uint16_t env_seg)
+static void write_psp(uc_engine *u, uint16_t psp_seg, uint16_t env_seg, const char *cmd_tail)
 {
     uint8_t psp[256];
     memset(psp, 0, sizeof(psp));
@@ -3115,18 +3136,21 @@ static void write_psp(uc_engine *u, uint16_t psp_seg, uint16_t env_seg)
     uint16_t env = env_seg;
     memcpy(psp + 0x2C, &env, 2);
 
-    psp[0x80] = 0;
-    psp[0x81] = 0x0D;
+    size_t len = strlen(cmd_tail);
+    if (len > 126) len = 126;
+    psp[0x80] = (uint8_t)len;
+    if (len > 0) memcpy(psp + 0x81, cmd_tail, len);
+    psp[0x81 + len] = 0x0D;
 
     uc_mem_write(u, base, psp, sizeof(psp));
 }
 
-static int load_com(uc_engine *u, const uint8_t *buf, long size, uint32_t *start_ip)
+static int load_com(uc_engine *u, const uint8_t *buf, long size, uint32_t *start_ip, const char *cmd_tail)
 {
     if (size > 0xFF00)
         return -1;
 
-    write_psp(u, 0, ENV_SEG);
+    write_psp(u, 0, ENV_SEG, cmd_tail);
     write_environment(u, ENV_SEG);
 
     uc_mem_write(u, COM_LOAD_OFFSET, buf, size);
@@ -3150,7 +3174,7 @@ static int load_com(uc_engine *u, const uint8_t *buf, long size, uint32_t *start
     return 0;
 }
 
-static int load_mz(uc_engine *u, const uint8_t *buf, long size, uint32_t *start_ip)
+static int load_mz(uc_engine *u, const uint8_t *buf, long size, uint32_t *start_ip, const char *cmd_tail)
 {
     if (size < (long)sizeof(MZHeader))
         return -1;
@@ -3214,7 +3238,7 @@ static int load_mz(uc_engine *u, const uint8_t *buf, long size, uint32_t *start_
 
     uint16_t psp_seg = MZ_LOAD_SEG - 0x10;
 
-    write_psp(u, psp_seg, ENV_SEG);
+    write_psp(u, psp_seg, ENV_SEG, cmd_tail);
     write_environment(u, ENV_SEG);
 
     current_psp_seg = psp_seg;
@@ -3236,7 +3260,7 @@ static int load_mz(uc_engine *u, const uint8_t *buf, long size, uint32_t *start_
     return 0;
 }
 
-static int load_program(uc_engine *u, const char *path, uint32_t *start_ip)
+static int load_program(uc_engine *u, const char *path, uint32_t *start_ip, const char *cmd_tail)
 {
     FILE *f = fopen(path, "rb");
     if (!f)
@@ -3268,9 +3292,9 @@ static int load_program(uc_engine *u, const char *path, uint32_t *start_ip)
     int rc;
 
     if (size >= 2 && buf[0] == 'M' && buf[1] == 'Z')
-        rc = load_mz(u, buf, size, start_ip);
+        rc = load_mz(u, buf, size, start_ip, cmd_tail);
     else
-        rc = load_com(u, buf, size, start_ip);
+        rc = load_com(u, buf, size, start_ip, cmd_tail);
 
     free(buf);
     return rc;
@@ -3279,7 +3303,7 @@ static int load_program(uc_engine *u, const char *path, uint32_t *start_ip)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s program.com|program.exe\n", argv[0]);
+        fprintf(stderr, "Usage: %s program.com|program.exe [args...]\n", argv[0]);
         return 1;
     }
 
@@ -3287,6 +3311,20 @@ int main(int argc, char **argv)
         return 1;
 
     init_dos_handles();
+
+    char cmd_tail[128] = "";
+    size_t tail_len = 0;
+    for (int i = 2; i < argc; i++) {
+        if (tail_len < 126) cmd_tail[tail_len++] = ' ';
+        size_t arg_len = strlen(argv[i]);
+        if (tail_len + arg_len < 126) {
+            memcpy(cmd_tail + tail_len, argv[i], arg_len);
+            tail_len += arg_len;
+        } else {
+            break;
+        }
+    }
+    cmd_tail[tail_len] = '\0';
 
     uc_err err;
 
@@ -3306,7 +3344,7 @@ int main(int argc, char **argv)
 
     uint32_t start_ip = 0;
 
-    if (load_program(uc, argv[1], &start_ip) != 0) {
+    if (load_program(uc, argv[1], &start_ip, cmd_tail) != 0) {
         fprintf(stderr, "Failed to load %s\n", argv[1]);
         return 1;
     }
