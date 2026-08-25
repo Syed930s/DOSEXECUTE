@@ -473,8 +473,6 @@ static void video_init(uc_engine *u)
 
 static void video_putc(uc_engine *u, uint8_t ch, uint8_t attr)
 {
-
-
     if (ch == 0x0D) putchar('\r');
     else if (ch == 0x0A) { putchar('\n'); fflush(stdout); }
     else if (ch >= 0x20 && ch < 0x7F) { putchar(ch); fflush(stdout); }
@@ -2606,10 +2604,14 @@ static void handle_int21(uc_engine *u)
                 dos_success(u);
                 break;
 
-                /* execute program (EXEC) */
+                /* execute program (EXEC) - FIXED */
                 case 0x4B: {
-                    char host[512];
+                    if (al != 0x00) { // Only support load and execute (AL=0)
+                        dos_error(u, DOS_ERR_INVALID_FUNC);
+                        break;
+                    }
 
+                    char host[512];
                     if (read_dos_path(u, ds, dx, host, sizeof(host)) != 0) {
                         dos_error(u, DOS_ERR_FILE_NOT_FOUND);
                         break;
@@ -2620,7 +2622,17 @@ static void handle_int21(uc_engine *u)
                         break;
                     }
 
-                    dos_error(u, DOS_ERR_NO_MEMORY);
+                    // Load the new program into the emulator
+                    uint32_t new_start_ip = 0;
+
+                    if (load_program(u, host, &new_start_ip, "") == 0) {
+                        // Successfully loaded! Set IP to the new entry point.
+                        // CS and SS are already set by load_program/load_mz/load_com
+                        reg32_write(u, UC_X86_REG_EIP, new_start_ip & 0xFFFF);
+                        dos_success(u);
+                    } else {
+                        dos_error(u, DOS_ERR_NO_MEMORY);
+                    }
                     break;
                 }
 
